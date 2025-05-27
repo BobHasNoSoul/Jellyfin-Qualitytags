@@ -1,6 +1,6 @@
 (function () {
     const overlayClass = 'quality-overlay-label';
-    const CACHE_VERSION = 'v6';
+    const CACHE_VERSION = 'v7';
     const CACHE_KEY = `qualityOverlayCache-${CACHE_VERSION}`;
     
     const IGNORE_SELECTORS = [
