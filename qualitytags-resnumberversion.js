@@ -1,6 +1,6 @@
 (function () {
     const overlayClass = 'quality-overlay-label';
-    const CACHE_VERSION = 'v7';
+    const CACHE_VERSION = 'v9';
     const CACHE_KEY = `qualityOverlayCache-${CACHE_VERSION}`;
     
     const IGNORE_SELECTORS = [
@@ -17,6 +17,8 @@
     let currentDelay = 1000;
 
     const qualityColors = {
+        '720p': 'rgba(255, 165, 0, 0.85)',   // Orange
+        '1080p': 'rgba(0, 204, 204, 0.85)',  // Cyan
         SD: 'rgba(150, 150, 150, 0.85)',
         HD: 'rgba(0, 102, 204, 0.85)',
         UHD: 'rgba(0, 153, 51, 0.85)'
@@ -83,7 +85,12 @@
     function getQuality(mediaStream) {
         if (!mediaStream) return null;
         const height = mediaStream.Height || 0;
-        return height >= 1440 ? 'UHD' : height >= 531 ? 'HD' : height > 0 ? 'SD' : null;
+
+        if (height >= 1200) return 'UHD';
+        if (height >= 900 && height < 1200) return '1080p';
+        if (height >= 500 && height < 900) return '720p';
+        if (height > 0 && height < 500) return 'SD';
+        return null;
     }
 
     async function fetchFirstEpisode(userId, seriesId) {
