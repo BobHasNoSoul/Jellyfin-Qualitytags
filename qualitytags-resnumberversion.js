@@ -17,8 +17,8 @@
     let currentDelay = 1000;
 
     const qualityColors = {
-        '720p': 'rgba(255, 165, 0, 0.85)',   // Orange
-        '1080p': 'rgba(0, 204, 204, 0.85)',  // Cyan
+        '720p': 'rgba(255, 165, 0, 0.85)',
+        '1080p': 'rgba(0, 204, 204, 0.85)',
         SD: 'rgba(150, 150, 150, 0.85)',
         HD: 'rgba(0, 102, 204, 0.85)',
         UHD: 'rgba(0, 153, 51, 0.85)'
@@ -110,13 +110,9 @@
             });
 
             const episode = episodeResponse.Items?.[0];
-            if (!episode?.Id) {
-                console.debug("No episode found for series", seriesId);
-                return null;
-            }
+            if (!episode?.Id) return null;
             return episode;
-        } catch (err) {
-            console.debug('Failed to fetch first episode for series', seriesId, err);
+        } catch {
             return null;
         }
     }
@@ -129,16 +125,14 @@
             let item;
             try {
                 item = await ApiClient.getItem(userId, itemId);
-            } catch (e) {
+            } catch {
                 const url = ApiClient.getUrl(`/Items/${itemId}`, { userId });
                 const response = await fetchWithTimeout(url);
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 item = await response.json();
             }
 
-            if (!item || !MEDIA_TYPES.has(item.Type)) {
-                return null; 
-            }
+            if (!item || !MEDIA_TYPES.has(item.Type)) return null;
 
             let videoStream = null;
             let quality = null;
@@ -150,8 +144,7 @@
                     videoStream = fullEp?.MediaSources?.[0]?.MediaStreams?.find(s => s.Type === 'Video');
                     quality = getQuality(videoStream);
                 }
-            } 
-            else if (item.Type === "Season") {
+            } else if (item.Type === "Season") {
                 const seasonEpisodes = await ApiClient.ajax({
                     type: "GET",
                     url: ApiClient.getUrl("/Items", {
@@ -164,14 +157,13 @@
                     }),
                     dataType: "json"
                 });
-                
+
                 if (seasonEpisodes.Items?.[0]?.Id) {
                     const episode = await ApiClient.getItem(userId, seasonEpisodes.Items[0].Id);
                     videoStream = episode?.MediaSources?.[0]?.MediaStreams?.find(s => s.Type === 'Video');
                     quality = getQuality(videoStream);
                 }
-            }
-            else {
+            } else {
                 videoStream = item?.MediaSources?.[0]?.MediaStreams?.find(s => s.Type === 'Video');
                 quality = getQuality(videoStream);
             }
@@ -184,10 +176,9 @@
                 saveCache();
                 return quality;
             }
-            
+
             return null;
-        } catch (err) {
-            console.debug('Quality fetch failed', itemId, err);
+        } catch {
             handleApiError();
             return null;
         } finally {
@@ -232,7 +223,7 @@
 
     async function processElement(el, isPriority = false) {
         if (shouldIgnoreElement(el)) return;
-        
+
         const itemId = getItemIdFromElement(el);
         if (!itemId || seenItems.has(itemId)) return;
         seenItems.add(itemId);
@@ -251,16 +242,14 @@
             currentDelay;
 
         await new Promise(resolve => setTimeout(resolve, delay));
-        
+
         if (qualityOverlayCache[itemId]) {
             insertOverlay(el, qualityOverlayCache[itemId].quality);
             return;
         }
 
         const quality = await fetchItemQuality(userId, itemId);
-        if (quality) {
-            insertOverlay(el, quality);
-        }
+        if (quality) insertOverlay(el, quality);
     }
 
     function isElementVisible(el) {
@@ -288,7 +277,7 @@
         
         elements.forEach(el => {
             if (shouldIgnoreElement(el)) return;
-            
+
             const itemId = getItemIdFromElement(el);
             if (!itemId) return;
 
@@ -306,18 +295,26 @@
         });
     }
 
+    function hookIntoHistoryChanges(callback) {
+        const originalPushState = history.pushState;
+        const originalReplaceState = history.replaceState;
+
+        history.pushState = function (...args) {
+            originalPushState.apply(this, args);
+            callback();
+        };
+
+        history.replaceState = function (...args) {
+            originalReplaceState.apply(this, args);
+            callback();
+        };
+
+        window.addEventListener('popstate', callback);
+    }
+
     function setupNavigationHandlers() {
         if (navigationHandlerSetup) return;
         navigationHandlerSetup = true;
-
-        function checkUrlChange() {
-            if (window.location.href !== currentUrl) {
-                currentUrl = window.location.href;
-                seenItems.clear();
-                visibilityObserver.disconnect();
-                setTimeout(renderVisibleTags, 300);
-            }
-        }
 
         document.addEventListener('click', (e) => {
             const backButton = e.target.closest('button.headerButtonLeft:nth-child(1) > span:nth-child(1)');
@@ -329,12 +326,11 @@
             }
         });
 
-        setInterval(checkUrlChange, 1000);
-        window.addEventListener('popstate', () => {
-            setTimeout(() => {
-                seenItems.clear();
-                renderVisibleTags();
-            }, 300);
+        hookIntoHistoryChanges(() => {
+            currentUrl = window.location.href;
+            seenItems.clear();
+            visibilityObserver.disconnect();
+            setTimeout(renderVisibleTags, 300);
         });
     }
 
@@ -367,4 +363,11 @@
         }
     });
     mutationObserver.observe(document.body, { childList: true, subtree: true });
+
+    async function fetchWithTimeout(url, timeout = config.REQUEST_TIMEOUT) {
+        return Promise.race([
+            fetch(url),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), timeout))
+        ]);
+    }
 })();
