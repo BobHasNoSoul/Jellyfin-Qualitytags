@@ -8,7 +8,10 @@
         'html.preload.layout-desktop body.force-scroll.libraryDocument.withSectionTabs.mouseIdle div#reactRoot div.mainAnimatedPages.skinBody div#indexPage.page.homePage.libraryPage.allLibraryPage.backdropPage.pageWithAbsoluteTabs.withTabs.mainAnimatedPage div#homeTab.tabContent.pageTabContent.is-active div.sections.homeSectionsContainer div.verticalSection.MyMedia.emby-scroller-container a.cardImageContainer'
     ];
     
-    const MEDIA_TYPES = new Set(['Movie', 'Episode', 'Series', 'Season']);
+    const MEDIA_TYPES = new Set([
+        'Movie','Episode','Series','Season',
+        'MusicAlbum','AudioBook','Book'
+    ]);
     
     let qualityOverlayCache = JSON.parse(localStorage.getItem(CACHE_KEY)) || {};
     let seenItems = new Set();
@@ -16,12 +19,21 @@
     let errorCount = 0;
     let currentDelay = 1000;
 
+    // unified pastel palette for all tags
     const qualityColors = {
-        '720p': 'rgba(255, 165, 0, 0.85)',
-        '1080p': 'rgba(0, 204, 204, 0.85)',
-        SD: 'rgba(150, 150, 150, 0.85)',
-        HD: 'rgba(0, 102, 204, 0.85)',
-        UHD: 'rgba(0, 153, 51, 0.85)'
+        '720p':  'rgba(255, 165,   0, 0.85)',  // pastel orange
+        '1080p': 'rgba(0,   204, 204, 0.85)',  // pastel teal
+        '1440p': 'rgba(0,   150, 136, 0.85)',  // deep pastel teal
+        'SD':    'rgba(150, 150, 150, 0.85)',  // neutral grey
+        'HD':    'rgba(0,   102, 204, 0.85)',  // pastel blue
+        'UHD':   'rgba(0,   153,  51, 0.85)',  // pastel green
+        // audio & other tags
+        'MP3':   'rgba(255, 192, 203, 0.85)',  // pastel pink
+        'FLAC':  'rgba(255, 218, 185, 0.85)',  // pastel peach
+        'M4A':   'rgba(255, 255, 204, 0.85)',  // pastel yellow
+        'Atmos': 'rgba(173, 216, 230, 0.85)',  // pastel light blue
+        'EPUB':  'rgba(221, 160, 221, 0.85)',  // pastel lavender
+        'PDF':   'rgba(152, 251, 152, 0.85)'   // pastel mint
     };
 
     const config = {
@@ -38,12 +50,11 @@
         threshold: 0.01
     });
 
-    let currentUrl = window.location.href;
     let navigationHandlerSetup = false;
 
     function getUserId() {
         try {
-            return (window.ApiClient?._serverInfo?.UserId) || null;
+            return window.ApiClient?._serverInfo?.UserId || null;
         } catch {
             return null;
         }
@@ -67,7 +78,8 @@
         const badge = document.createElement('div');
         badge.textContent = label;
         badge.className = overlayClass;
-        badge.style.background = qualityColors[label] || qualityColors.SD;
+        const key = label.split(' ')[0];  // matches our qualityColors keys
+        badge.style.background = qualityColors[key] || qualityColors['SD'];
         badge.style.position = 'absolute';
         badge.style.top = '6px';
         badge.style.left = '6px';
@@ -82,15 +94,18 @@
         return badge;
     }
 
-    function getQuality(mediaStream) {
-        if (!mediaStream) return null;
-        const height = mediaStream.Height || 0;
-
-        if (height >= 1200) return 'UHD';
-        if (height >= 900 && height < 1200) return '1080p';
-        if (height >= 500 && height < 900) return '720p';
-        if (height > 0 && height < 500) return 'SD';
-        return null;
+    function getQualityInfo(ms) {
+        if (!ms) return null;
+        const h = ms.Height || 0;
+        let q = null;
+        if (h >= 2160)      q = 'UHD';
+        else if (h >= 1440) q = '1440p';
+        else if (h >= 1080) q = '1080p';
+        else if (h >= 720)  q = '720p';
+        else if (h > 0)     q = 'SD';
+        else return null;
+        const range = (ms.VideoRange || 'SDR').toUpperCase();
+        return { quality: q, range };
     }
 
     async function fetchFirstEpisode(userId, seriesId) {
@@ -104,14 +119,12 @@
                     SortBy: "PremiereDate",
                     SortOrder: "Ascending",
                     Limit: 1,
-                    userId: userId
+                    userId
                 }),
                 dataType: "json"
             });
-
             const episode = episodeResponse.Items?.[0];
-            if (!episode?.Id) return null;
-            return episode;
+            return episode?.Id ? episode : null;
         } catch {
             return null;
         }
@@ -122,108 +135,106 @@
         pendingRequests.add(itemId);
 
         try {
-            let item;
-            try {
-                item = await ApiClient.getItem(userId, itemId);
-            } catch {
-                const url = ApiClient.getUrl(`/Items/${itemId}`, { userId });
-                const response = await fetchWithTimeout(url);
-                if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                item = await response.json();
-            }
-
+            const item = await ApiClient.getItem(userId, itemId);
             if (!item || !MEDIA_TYPES.has(item.Type)) return null;
 
-            let videoStream = null;
-            let quality = null;
+            let mediaSrc = item.MediaSources?.[0];
 
-            if (item.Type === "Series") {
-                const ep = await fetchFirstEpisode(userId, item.Id);
-                if (ep?.Id) {
-                    const fullEp = await ApiClient.getItem(userId, ep.Id);
-                    videoStream = fullEp?.MediaSources?.[0]?.MediaStreams?.find(s => s.Type === 'Video');
-                    quality = getQuality(videoStream);
-                }
-            } else if (item.Type === "Season") {
-                const seasonEpisodes = await ApiClient.ajax({
-                    type: "GET",
-                    url: ApiClient.getUrl("/Items", {
+            if (item.Type === 'MusicAlbum') {
+                const resp = await ApiClient.ajax({
+                    type: 'GET',
+                    url: ApiClient.getUrl('/Items', {
                         ParentId: item.Id,
-                        IncludeItemTypes: "Episode",
+                        IncludeItemTypes: 'Audio',
                         Limit: 1,
-                        SortBy: "PremiereDate",
-                        SortOrder: "Ascending",
-                        userId: userId
+                        SortBy: 'TrackNumber',
+                        SortOrder: 'Ascending',
+                        userId
                     }),
-                    dataType: "json"
+                    dataType: 'json'
                 });
-
-                if (seasonEpisodes.Items?.[0]?.Id) {
-                    const episode = await ApiClient.getItem(userId, seasonEpisodes.Items[0].Id);
-                    videoStream = episode?.MediaSources?.[0]?.MediaStreams?.find(s => s.Type === 'Video');
-                    quality = getQuality(videoStream);
+                const track = resp.Items?.[0];
+                if (track?.Id) {
+                    const fullTrack = await ApiClient.getItem(userId, track.Id);
+                    mediaSrc = fullTrack.MediaSources?.[0];
                 }
-            } else {
-                videoStream = item?.MediaSources?.[0]?.MediaStreams?.find(s => s.Type === 'Video');
-                quality = getQuality(videoStream);
             }
 
-            if (quality) {
-                qualityOverlayCache[itemId] = {
-                    quality,
-                    timestamp: Date.now()
-                };
+            let videoTag = '', audioTag = '', bookTag = '';
+
+            if (['Movie','Episode','Series','Season'].includes(item.Type)) {
+                const vs = mediaSrc?.MediaStreams?.find(s => s.Type === 'Video');
+                const info = getQualityInfo(vs);
+                if (info) videoTag = `${info.quality} ${info.range}`;
+            }
+
+            if (['AudioBook','Audio','MusicAlbum'].includes(item.Type)) {
+                if (mediaSrc?.Container) audioTag = mediaSrc.Container.toUpperCase();
+                const aud = mediaSrc?.MediaStreams?.find(s => s.Type === 'Audio');
+                const layout = (aud?.ChannelLayout || '').toLowerCase();
+                const codec  = (aud?.Codec || '').toLowerCase();
+                if (layout.includes('atmos') || codec.includes('atmos')) {
+                    audioTag += audioTag ? ' • Atmos' : 'Atmos';
+                }
+            }
+
+            if (item.Type === 'Book') {
+                const ext = (item.Path||'').split('.').pop().toLowerCase();
+                if (['epub','pdf','mobi','azw3'].includes(ext)) bookTag = ext.toUpperCase();
+                else if (item.Format) bookTag = item.Format.toUpperCase();
+            }
+
+            const parts = [];
+            if (videoTag) parts.push(videoTag);
+            if (audioTag) parts.push(audioTag);
+            if (bookTag)  parts.push(bookTag);
+            const final = parts.join(' • ');
+
+            if (final) {
+                qualityOverlayCache[itemId] = { quality: final, timestamp: Date.now() };
                 saveCache();
-                return quality;
+                return final;
             }
-
             return null;
         } catch {
-            handleApiError();
+            errorCount++;
+            currentDelay = Math.min(
+                config.MAX_DELAY,
+                config.BASE_DELAY * Math.pow(2, Math.min(errorCount, 5)) *
+                (0.8 + Math.random() * 0.4)
+            );
             return null;
         } finally {
             pendingRequests.delete(itemId);
         }
     }
 
-    function handleApiError() {
-        errorCount++;
-        currentDelay = Math.min(
-            config.MAX_DELAY,
-            config.BASE_DELAY * Math.pow(2, Math.min(errorCount, 5)) * (0.8 + Math.random() * 0.4)
-        );
-    }
-
-    function insertOverlay(container, quality) {
+    function insertOverlay(container, label) {
         if (!container || container.querySelector(`.${overlayClass}`)) return;
-
         if (getComputedStyle(container).position === 'static') {
             container.style.position = 'relative';
         }
-
-        const label = createLabel(quality);
-        container.appendChild(label);
+        container.appendChild(createLabel(label));
     }
 
     function getItemIdFromElement(el) {
         if (el.href) {
-            const match = el.href.match(/id=([a-f0-9]{32})/i);
-            if (match) return match[1];
+            const m = el.href.match(/id=([a-f0-9]{32})/i);
+            if (m) return m[1];
         }
         if (el.style.backgroundImage) {
-            const match = el.style.backgroundImage.match(/\/Items\/([a-f0-9]{32})\//i);
-            if (match) return match[1];
+            const m = el.style.backgroundImage.match(/\/Items\/([a-f0-9]{32})\//i);
+            if (m) return m[1];
         }
         return null;
     }
 
     function shouldIgnoreElement(el) {
-        return IGNORE_SELECTORS.some(selector => el.closest(selector) !== null);
+        return IGNORE_SELECTORS.some(sel => el.closest(sel));
     }
 
     async function processElement(el, isPriority = false) {
         if (shouldIgnoreElement(el)) return;
-
         const itemId = getItemIdFromElement(el);
         if (!itemId || seenItems.has(itemId)) return;
         seenItems.add(itemId);
@@ -237,97 +248,62 @@
         const userId = getUserId();
         if (!userId) return;
 
-        const delay = isPriority ? 
-            Math.min(config.VISIBLE_PRIORITY_DELAY, currentDelay) :
-            currentDelay;
-
-        await new Promise(resolve => setTimeout(resolve, delay));
-
-        if (qualityOverlayCache[itemId]) {
-            insertOverlay(el, qualityOverlayCache[itemId].quality);
-            return;
-        }
-
+        await new Promise(r => setTimeout(r, isPriority ? config.VISIBLE_PRIORITY_DELAY : currentDelay));
         const quality = await fetchItemQuality(userId, itemId);
         if (quality) insertOverlay(el, quality);
     }
 
     function isElementVisible(el) {
-        const rect = el.getBoundingClientRect();
+        const r = el.getBoundingClientRect();
         return (
-            rect.top <= (window.innerHeight + 300) &&
-            rect.bottom >= -300 &&
-            rect.left <= (window.innerWidth + 300) &&
-            rect.right >= -300
+            r.top <= window.innerHeight + 300 &&
+            r.bottom >= -300 &&
+            r.left <= window.innerWidth + 300 &&
+            r.right >= -300
         );
     }
 
     function handleIntersection(entries) {
-        entries.forEach(entry => {
-            if (entry.isIntersecting) {
-                const el = entry.target;
-                visibilityObserver.unobserve(el);
-                processElement(el, true);
+        entries.forEach(e => {
+            if (e.isIntersecting) {
+                visibilityObserver.unobserve(e.target);
+                processElement(e.target, true);
             }
         });
     }
 
     function renderVisibleTags() {
-        const elements = Array.from(document.querySelectorAll('a.cardImageContainer, div.listItemImage'));
-        
-        elements.forEach(el => {
-            if (shouldIgnoreElement(el)) return;
-
-            const itemId = getItemIdFromElement(el);
-            if (!itemId) return;
-
-            const cached = qualityOverlayCache[itemId];
-            if (cached) {
-                insertOverlay(el, cached.quality);
-                return;
-            }
-
-            if (isElementVisible(el)) {
-                processElement(el, true);
-            } else {
-                visibilityObserver.observe(el);
-            }
-        });
+        Array.from(document.querySelectorAll('a.cardImageContainer, div.listItemImage'))
+            .forEach(el => {
+                if (shouldIgnoreElement(el)) return;
+                const id = getItemIdFromElement(el);
+                if (!id) return;
+                const cached = qualityOverlayCache[id];
+                if (cached) insertOverlay(el, cached.quality);
+                else if (isElementVisible(el)) processElement(el, true);
+                else visibilityObserver.observe(el);
+            });
     }
 
-    function hookIntoHistoryChanges(callback) {
-        const originalPushState = history.pushState;
-        const originalReplaceState = history.replaceState;
-
-        history.pushState = function (...args) {
-            originalPushState.apply(this, args);
-            callback();
-        };
-
-        history.replaceState = function (...args) {
-            originalReplaceState.apply(this, args);
-            callback();
-        };
-
-        window.addEventListener('popstate', callback);
+    function hookIntoHistoryChanges(cb) {
+        const op = history.pushState, or = history.replaceState;
+        history.pushState  = function(...a){ op.apply(this,a); cb(); };
+        history.replaceState = function(...a){ or.apply(this,a); cb(); };
+        window.addEventListener('popstate', cb);
     }
 
     function setupNavigationHandlers() {
         if (navigationHandlerSetup) return;
         navigationHandlerSetup = true;
-
-        document.addEventListener('click', (e) => {
-            const backButton = e.target.closest('button.headerButtonLeft:nth-child(1) > span:nth-child(1)');
-            if (backButton) {
+        document.addEventListener('click', e => {
+            if (e.target.closest('button.headerButtonLeft > span')) {
                 setTimeout(() => {
                     seenItems.clear();
                     renderVisibleTags();
                 }, 500);
             }
         });
-
         hookIntoHistoryChanges(() => {
-            currentUrl = window.location.href;
             seenItems.clear();
             visibilityObserver.disconnect();
             setTimeout(renderVisibleTags, 300);
@@ -336,19 +312,18 @@
 
     function addStyles() {
         if (document.getElementById('quality-tag-style')) return;
-        const style = document.createElement('style');
-        style.id = 'quality-tag-style';
-        style.textContent = `
+        const s = document.createElement('style');
+        s.id = 'quality-tag-style';
+        s.textContent = `
             .${overlayClass} {
                 user-select: none;
                 pointer-events: none;
             }
         `;
-        document.head.appendChild(style);
+        document.head.appendChild(s);
     }
 
     addStyles();
-    
     setTimeout(() => {
         setupNavigationHandlers();
         renderVisibleTags();
@@ -357,17 +332,16 @@
     window.addEventListener('beforeunload', saveCache);
     setInterval(saveCache, 60000);
 
-    const mutationObserver = new MutationObserver((mutations) => {
-        if (mutations.some(m => m.addedNodes.length > 0)) {
-            setTimeout(renderVisibleTags, 1000);
-        }
+    const mutationObserver = new MutationObserver(ms => {
+        if (ms.some(m => m.addedNodes.length)) setTimeout(renderVisibleTags,1000);
     });
-    mutationObserver.observe(document.body, { childList: true, subtree: true });
+    mutationObserver.observe(document.body,{ childList:true, subtree:true });
 
     async function fetchWithTimeout(url, timeout = config.REQUEST_TIMEOUT) {
         return Promise.race([
             fetch(url),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), timeout))
+            new Promise((_,reject)=>setTimeout(()=>reject(new Error('Timeout')),timeout))
         ]);
     }
 })();
+
