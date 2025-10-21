@@ -1,5 +1,7 @@
 this is a repo for the modification of jellyfin webui that gives you quality tags over your posters and thumbnails (UHD SD HD) 
 
+confirmed working on 10.11.0
+
 it is simple to install so simply go to your webroot typically /usr/share/jellyfin/web on linux (windows is another dir but same idea) and edit your index.html
 
 add the following before the </body> tag 
