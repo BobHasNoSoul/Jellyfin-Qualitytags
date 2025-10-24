@@ -1,373 +1,93 @@
 (function () {
+    // --- CONFIGURATION & CONSTANTS ---
     const overlayClass = 'quality-overlay-label';
-    const CACHE_VERSION = 'v9';
+    const CACHE_VERSION = 'v15';
     const CACHE_KEY = `qualityOverlayCache-${CACHE_VERSION}`;
-    
+
     const IGNORE_SELECTORS = [
         'html.preload.layout-desktop body.force-scroll.libraryDocument div#reactRoot div.mainAnimatedPages.skinBody div#itemDetailPage.page.libraryPage.itemDetailPage.noSecondaryNavPage.selfBackdropPage.mainAnimatedPage div.detailPageWrapperContainer div.detailPageSecondaryContainer.padded-bottom-page div.detailPageContent div#castCollapsible.verticalSection.detailVerticalSection.emby-scroller-container a.cardImageContainer',
         'html.preload.layout-desktop body.force-scroll.libraryDocument.withSectionTabs.mouseIdle div#reactRoot div.mainAnimatedPages.skinBody div#indexPage.page.homePage.libraryPage.allLibraryPage.backdropPage.pageWithAbsoluteTabs.withTabs.mainAnimatedPage div#homeTab.tabContent.pageTabContent.is-active div.sections.homeSectionsContainer div.verticalSection.MyMedia.emby-scroller-container a.cardImageContainer'
     ];
-    
-    const MEDIA_TYPES = new Set(['Movie', 'Episode', 'Series', 'Season']);
-    
-    let qualityOverlayCache = JSON.parse(localStorage.getItem(CACHE_KEY)) || {};
-    let seenItems = new Set();
-    let pendingRequests = new Set();
-    let errorCount = 0;
-    let currentDelay = 1000;
 
-    const qualityColors = {
-        '720p': 'rgba(255, 165, 0, 0.85)',
-        '1080p': 'rgba(0, 204, 204, 0.85)',
-        SD: 'rgba(150, 150, 150, 0.85)',
-        HD: 'rgba(0, 102, 204, 0.85)',
-        UHD: 'rgba(0, 153, 51, 0.85)'
+    const MEDIA_TYPES = new Set(['Movie','Episode','Series','Season','Audio','MusicAlbum','AudioBook','Book']);
+
+    const colors = {
+        '720p': 'rgba(255,165,0,0.85)', '1080p': 'rgba(0,204,204,0.85)', 'UHD': 'rgba(0,153,51,0.85)', 'SD': 'rgba(150,150,150,0.85)',
+        'MP3': 'rgba(255,192,203,0.85)', 'FLAC': 'rgba(255,218,185,0.85)', 'M4A': 'rgba(255,255,204,0.85)', 'OPUS': 'rgba(173,216,230,0.85)', 'AAC': 'rgba(152,251,152,0.85)', 'OGG': 'rgba(221,160,221,0.85)',
+        'EPUB': 'rgba(176,196,222,0.85)', 'PDF': 'rgba(205,133,63,0.85)', 'MOBI': 'rgba(222,184,135,0.85)', 'AZW3': 'rgba(240,230,140,0.85)', 'CBZ': 'rgba(255,228,196,0.85)', 'CBR': 'rgba(255,222,173,0.85)', 'DJVU': 'rgba(221,160,221,0.85)', 'PDB': 'rgba(176,224,230,0.85)', 'FB2': 'rgba(152,251,152,0.85)'
     };
 
-    const config = {
-        MAX_CONCURRENT_REQUESTS: 9,
-        BASE_DELAY: 1000,
-        MAX_DELAY: 10000,
-        VISIBLE_PRIORITY_DELAY: 200,
-        CACHE_TTL: 7 * 24 * 60 * 60 * 1000,
-        REQUEST_TIMEOUT: 5000
-    };
+    const config = { BASE_DELAY:1000, MAX_DELAY:10000, VISIBLE_PRIORITY_DELAY:200, CACHE_TTL:7*24*60*60*1000, REQUEST_TIMEOUT:5000 };
 
-    const visibilityObserver = new IntersectionObserver(handleIntersection, {
-        rootMargin: '300px',
-        threshold: 0.01
-    });
+    let cache = JSON.parse(localStorage.getItem(CACHE_KEY)) || {};
+    let seen = new Set(), pending = new Set(), errorCount = 0, delay = config.BASE_DELAY;
 
-    let currentUrl = window.location.href;
-    let navigationHandlerSetup = false;
+    const observer = new IntersectionObserver(onIntersect, { rootMargin: '300px', threshold: 0.01 });
+    const mutObs = new MutationObserver(render);
 
-    function getUserId() {
-        try {
-            return (window.ApiClient?._serverInfo?.UserId) || null;
-        } catch {
-            return null;
+    function getUserId() { try { return window.ApiClient?._serverInfo?.UserId || null; } catch { return null; } }
+    function save() { try { const now = Date.now(); Object.entries(cache).forEach(([k,v])=>{ if(now-v.ts>config.CACHE_TTL) delete cache[k]; }); localStorage.setItem(CACHE_KEY,JSON.stringify(cache)); } catch {} }
+
+    function createBadge(text) { const d=document.createElement('div'); d.textContent=text; d.className=overlayClass; d.style.cssText=`background:${colors[text]||colors.SD};position:absolute;top:6px;left:6px;color:white;padding:2px 6px;font-size:12px;font-weight:bold;border-radius:4px;z-index:99;pointer-events:none;user-select:none;`; return d; }
+
+    function detectTag(item) {
+        if (!item) return null;
+        // reuse original fetchItemQuality logic for book
+        if (item.Type==='Book') {
+            // check extension and Format
+            const ext=(item.Path||'').split('.').pop().toUpperCase();
+            if (ext && colors[ext]) return ext;
+            if (item.Format && colors[item.Format.toUpperCase()]) return item.Format.toUpperCase();
         }
-    }
-
-    function saveCache() {
-        try {
-            const now = Date.now();
-            for (const [key, entry] of Object.entries(qualityOverlayCache)) {
-                if (now - entry.timestamp > config.CACHE_TTL) {
-                    delete qualityOverlayCache[key];
-                }
-            }
-            localStorage.setItem(CACHE_KEY, JSON.stringify(qualityOverlayCache));
-        } catch (e) {
-            console.warn('Failed to save cache', e);
+        // fallback to mediaStreams/container
+        const src=item.MediaSources?.[0]; if(!src) return null;
+        if (['Movie','Episode','Series','Season'].includes(item.Type)) {
+            const vs=src.MediaStreams?.find(s=>s.Type==='Video'); const h=vs?.Height||0;
+            if(h>=2160) return 'UHD'; if(h>=1080) return '1080p'; if(h>=720) return '720p'; if(h>0) return 'SD';
         }
-    }
-
-    function createLabel(label) {
-        const badge = document.createElement('div');
-        badge.textContent = label;
-        badge.className = overlayClass;
-        badge.style.background = qualityColors[label] || qualityColors.SD;
-        badge.style.position = 'absolute';
-        badge.style.top = '6px';
-        badge.style.left = '6px';
-        badge.style.color = 'white';
-        badge.style.padding = '2px 6px';
-        badge.style.fontSize = '12px';
-        badge.style.fontWeight = 'bold';
-        badge.style.borderRadius = '4px';
-        badge.style.zIndex = '99';
-        badge.style.pointerEvents = 'none';
-        badge.style.userSelect = 'none';
-        return badge;
-    }
-
-    function getQuality(mediaStream) {
-        if (!mediaStream) return null;
-        const height = mediaStream.Height || 0;
-
-        if (height >= 1200) return 'UHD';
-        if (height >= 900 && height < 1200) return '1080p';
-        if (height >= 500 && height < 900) return '720p';
-        if (height > 0 && height < 500) return 'SD';
-        return null;
-    }
-
-    async function fetchFirstEpisode(userId, seriesId) {
-        try {
-            const episodeResponse = await ApiClient.ajax({
-                type: "GET",
-                url: ApiClient.getUrl("/Items", {
-                    ParentId: seriesId,
-                    IncludeItemTypes: "Episode",
-                    Recursive: true,
-                    SortBy: "PremiereDate",
-                    SortOrder: "Ascending",
-                    Limit: 1,
-                    userId: userId
-                }),
-                dataType: "json"
-            });
-
-            const episode = episodeResponse.Items?.[0];
-            if (!episode?.Id) return null;
-            return episode;
-        } catch {
-            return null;
-        }
-    }
-
-    async function fetchItemQuality(userId, itemId) {
-        if (pendingRequests.has(itemId)) return null;
-        pendingRequests.add(itemId);
-
-        try {
-            let item;
-            try {
-                item = await ApiClient.getItem(userId, itemId);
-            } catch {
-                const url = ApiClient.getUrl(`/Items/${itemId}`, { userId });
-                const response = await fetchWithTimeout(url);
-                if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                item = await response.json();
-            }
-
-            if (!item || !MEDIA_TYPES.has(item.Type)) return null;
-
-            let videoStream = null;
-            let quality = null;
-
-            if (item.Type === "Series") {
-                const ep = await fetchFirstEpisode(userId, item.Id);
-                if (ep?.Id) {
-                    const fullEp = await ApiClient.getItem(userId, ep.Id);
-                    videoStream = fullEp?.MediaSources?.[0]?.MediaStreams?.find(s => s.Type === 'Video');
-                    quality = getQuality(videoStream);
-                }
-            } else if (item.Type === "Season") {
-                const seasonEpisodes = await ApiClient.ajax({
-                    type: "GET",
-                    url: ApiClient.getUrl("/Items", {
-                        ParentId: item.Id,
-                        IncludeItemTypes: "Episode",
-                        Limit: 1,
-                        SortBy: "PremiereDate",
-                        SortOrder: "Ascending",
-                        userId: userId
-                    }),
-                    dataType: "json"
-                });
-
-                if (seasonEpisodes.Items?.[0]?.Id) {
-                    const episode = await ApiClient.getItem(userId, seasonEpisodes.Items[0].Id);
-                    videoStream = episode?.MediaSources?.[0]?.MediaStreams?.find(s => s.Type === 'Video');
-                    quality = getQuality(videoStream);
-                }
-            } else {
-                videoStream = item?.MediaSources?.[0]?.MediaStreams?.find(s => s.Type === 'Video');
-                quality = getQuality(videoStream);
-            }
-
-            if (quality) {
-                qualityOverlayCache[itemId] = {
-                    quality,
-                    timestamp: Date.now()
-                };
-                saveCache();
-                return quality;
-            }
-
-            return null;
-        } catch {
-            handleApiError();
-            return null;
-        } finally {
-            pendingRequests.delete(itemId);
-        }
-    }
-
-    function handleApiError() {
-        errorCount++;
-        currentDelay = Math.min(
-            config.MAX_DELAY,
-            config.BASE_DELAY * Math.pow(2, Math.min(errorCount, 5)) * (0.8 + Math.random() * 0.4)
-        );
-    }
-
-    function insertOverlay(container, quality) {
-        if (!container || container.querySelector(`.${overlayClass}`)) return;
-
-        if (getComputedStyle(container).position === 'static') {
-            container.style.position = 'relative';
-        }
-
-        const label = createLabel(quality);
-        container.appendChild(label);
-    }
-
-    function getItemIdFromElement(el) {
-        if (el.href) {
-            const match = el.href.match(/id=([a-f0-9]{32})/i);
-            if (match) return match[1];
-        }
-        if (el.style.backgroundImage) {
-            const match = el.style.backgroundImage.match(/\/Items\/([a-f0-9]{32})\//i);
-            if (match) return match[1];
+        if (['Audio','MusicAlbum','AudioBook'].includes(item.Type)) {
+            const aud=src.MediaStreams?.find(s=>s.Type==='Audio'); const codec=aud?.Codec?.toUpperCase(); if(codec && colors[codec]) return codec;
+            const cont=src.Container?.toUpperCase(); if(cont && colors[cont]) return cont;
         }
         return null;
     }
 
-    function shouldIgnoreElement(el) {
-        return IGNORE_SELECTORS.some(selector => el.closest(selector) !== null);
-    }
-
-    async function processElement(el, isPriority = false) {
-        if (shouldIgnoreElement(el)) return;
-
-        const itemId = getItemIdFromElement(el);
-        if (!itemId || seenItems.has(itemId)) return;
-        seenItems.add(itemId);
-
-        const cached = qualityOverlayCache[itemId];
-        if (cached) {
-            insertOverlay(el, cached.quality);
-            return;
-        }
-
-        const userId = getUserId();
-        if (!userId) return;
-
-        const delay = isPriority ? 
-            Math.min(config.VISIBLE_PRIORITY_DELAY, currentDelay) :
-            currentDelay;
-
-        await new Promise(resolve => setTimeout(resolve, delay));
-
-        if (qualityOverlayCache[itemId]) {
-            insertOverlay(el, qualityOverlayCache[itemId].quality);
-            return;
-        }
-
-        const quality = await fetchItemQuality(userId, itemId);
-        if (quality) insertOverlay(el, quality);
-    }
-
-    function isElementVisible(el) {
-        const rect = el.getBoundingClientRect();
-        return (
-            rect.top <= (window.innerHeight + 300) &&
-            rect.bottom >= -300 &&
-            rect.left <= (window.innerWidth + 300) &&
-            rect.right >= -300
-        );
-    }
-
-    function handleIntersection(entries) {
-        entries.forEach(entry => {
-            if (entry.isIntersecting) {
-                const el = entry.target;
-                visibilityObserver.unobserve(el);
-                processElement(el, true);
+    async function fetchTag(uid,id) {
+        if (pending.has(id)) return null; pending.add(id);
+        try {
+            let it=await ApiClient.getItem(uid,id); if(!it||!MEDIA_TYPES.has(it.Type)) return null;
+            if (it.Type==='Series' || it.Type==='Season') {
+                const eps=await ApiClient.ajax({type:'GET',url:ApiClient.getUrl('/Items',{ParentId:it.Id,IncludeItemTypes:'Episode',Recursive:true,SortBy:'PremiereDate',SortOrder:'Ascending',Limit:1,userId:uid}),dataType:'json'});
+                const ep=eps.Items?.[0]; if(ep?.Id) it=await ApiClient.getItem(uid,ep.Id);
             }
-        });
-    }
-
-    function renderVisibleTags() {
-        const elements = Array.from(document.querySelectorAll('a.cardImageContainer, div.listItemImage'));
-        
-        elements.forEach(el => {
-            if (shouldIgnoreElement(el)) return;
-
-            const itemId = getItemIdFromElement(el);
-            if (!itemId) return;
-
-            const cached = qualityOverlayCache[itemId];
-            if (cached) {
-                insertOverlay(el, cached.quality);
-                return;
+            if (it.Type==='MusicAlbum') {
+                const auds=await ApiClient.ajax({type:'GET',url:ApiClient.getUrl('/Items',{ParentId:it.Id,IncludeItemTypes:'Audio',Limit:1,SortBy:'TrackNumber',SortOrder:'Ascending',userId:uid}),dataType:'json'});
+                const tr=auds.Items?.[0]; if(tr?.Id) it=await ApiClient.getItem(uid,tr.Id);
             }
-
-            if (isElementVisible(el)) {
-                processElement(el, true);
-            } else {
-                visibilityObserver.observe(el);
-            }
-        });
+            const tag=detectTag(it);
+            if(tag){ cache[id]={tag,ts:Date.now()}; save(); return tag; }
+        } catch { errorCount++; delay=Math.min(config.MAX_DELAY,config.BASE_DELAY*Math.pow(2,errorCount)*(0.8+Math.random())); }
+        finally{ pending.delete(id);} return null;
     }
 
-    function hookIntoHistoryChanges(callback) {
-        const originalPushState = history.pushState;
-        const originalReplaceState = history.replaceState;
+    function getId(el) { const m=el.href?.match(/id=([a-f0-9]{32})/i)||el.style.backgroundImage?.match(/\/Items\/([a-f0-9]{32})\//i); return m?m[1]:el.dataset.id||null; }
+    function insert(el,txt){ if(!el||el.querySelector(`.${overlayClass}`)) return; if(getComputedStyle(el).position==='static') el.style.position='relative'; el.appendChild(createBadge(txt)); }
 
-        history.pushState = function (...args) {
-            originalPushState.apply(this, args);
-            callback();
-        };
-
-        history.replaceState = function (...args) {
-            originalReplaceState.apply(this, args);
-            callback();
-        };
-
-        window.addEventListener('popstate', callback);
+    async function process(el,prio=false){ const id=getId(el); if(!id||seen.has(id)) return; seen.add(id);
+        if(cache[id]){ insert(el,cache[id].tag); return; }
+        const uid=getUserId(); if(!uid) return;
+        await new Promise(r=>setTimeout(r,prio?config.VISIBLE_PRIORITY_DELAY:delay));
+        if(cache[id]){ insert(el,cache[id].tag); return; }
+        const t=await fetchTag(uid,id); if(t) insert(el,t);
     }
 
-    function setupNavigationHandlers() {
-        if (navigationHandlerSetup) return;
-        navigationHandlerSetup = true;
+    function onIntersect(entries){ entries.forEach(e=>{ if(e.isIntersecting){ observer.unobserve(e.target); process(e.target,true);} }); }
+    function isVisible(el){ const r=el.getBoundingClientRect(); return r.top<=innerHeight+300&&r.bottom>=-300&&r.left<=innerWidth+300&&r.right>=-300; }
+    function render(){ document.querySelectorAll('a.cardImageContainer,div.listItemImage,.card').forEach(el=>{ const c=el.querySelector('a.cardImageContainer,div.listItemImage')||el; const id=getId(c); if(!id) return; if(cache[id]) insert(c,cache[id].tag); else if(isVisible(c)) process(c,true); else observer.observe(c);} ); }
 
-        document.addEventListener('click', (e) => {
-            const backButton = e.target.closest('button.headerButtonLeft:nth-child(1) > span:nth-child(1)');
-            if (backButton) {
-                setTimeout(() => {
-                    seenItems.clear();
-                    renderVisibleTags();
-                }, 500);
-            }
-        });
+    function setupNav(){ const p=history.pushState,r=history.replaceState; history.pushState=function(...a){p.apply(this,a);render();}; history.replaceState=function(...a){r.apply(this,a);render();}; addEventListener('popstate',render); document.addEventListener('click',e=>{ if(e.target.closest('button.headerButtonLeft>span')) setTimeout(render,500); }); }
+    function addStyles(){ if(document.getElementById('quality-tag-style')) return; const s=document.createElement('style'); s.id='quality-tag-style'; s.textContent=`.${overlayClass}{user-select:none;pointer-events:none;}`; document.head.appendChild(s);}    
 
-        hookIntoHistoryChanges(() => {
-            currentUrl = window.location.href;
-            seenItems.clear();
-            visibilityObserver.disconnect();
-            setTimeout(renderVisibleTags, 300);
-        });
-    }
-
-    function addStyles() {
-        if (document.getElementById('quality-tag-style')) return;
-        const style = document.createElement('style');
-        style.id = 'quality-tag-style';
-        style.textContent = `
-            .${overlayClass} {
-                user-select: none;
-                pointer-events: none;
-            }
-        `;
-        document.head.appendChild(style);
-    }
-
-    addStyles();
-    
-    setTimeout(() => {
-        setupNavigationHandlers();
-        renderVisibleTags();
-    }, 1500);
-
-    window.addEventListener('beforeunload', saveCache);
-    setInterval(saveCache, 60000);
-
-    const mutationObserver = new MutationObserver((mutations) => {
-        if (mutations.some(m => m.addedNodes.length > 0)) {
-            setTimeout(renderVisibleTags, 1000);
-        }
-    });
-    mutationObserver.observe(document.body, { childList: true, subtree: true });
-
-    async function fetchWithTimeout(url, timeout = config.REQUEST_TIMEOUT) {
-        return Promise.race([
-            fetch(url),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), timeout))
-        ]);
-    }
+    // initialize
+    addStyles(); mutObs.observe(document.body,{childList:true,subtree:true}); setupNav(); setTimeout(render,1500); window.addEventListener('beforeunload',save); setInterval(save,60000);
 })();
